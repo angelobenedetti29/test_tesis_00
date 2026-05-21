@@ -3,11 +3,19 @@ import os
 import cv2
 import numpy as np
 import random
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                                QVBoxLayout, QPushButton, QLabel, QFrame, QProgressBar, 
                                QSpacerItem, QSizePolicy, QScrollArea)
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
+
+# Añadir el path para importar detection.py que contiene la integración de Hailo
+sys.path.append(os.path.join(os.path.dirname(__file__), 'yolov11-python'))
+try:
+    from detection import HailoInference, HAILO_AVAILABLE
+except ImportError:
+    HAILO_AVAILABLE = False
 
 QSS = """
 QMainWindow {
@@ -152,14 +160,17 @@ QProgressBar::chunk {
 class YOLODetectionThread(QThread):
     change_pixmap_signal = Signal(QImage)
 
-    def __init__(self, source_file="yolov11-python/data/videos/road.mp4"):
+    def __init__(self, source_file="yolov11-python/data/videos/road.mp4", display_width=640, display_height=480):
         super().__init__()
         self.source_file = source_file
         self.running = True
+        self.display_width = display_width
+        self.display_height = display_height
 
     def run(self):
         model_path = "yolov11-python/yolo11n.onnx"
         names_path = "yolov11-python/data/class.names"
+        hef_path = "/usr/share/hailo-models/yolov8s_h8l.hef"
         
         IMAGE_SIZE = 640
         NAMES = []
@@ -171,56 +182,108 @@ class YOLODetectionThread(QThread):
 
         COLORS = [[random.randint(0, 255) for _ in range(3)] for _ in NAMES]
         
-        try:
-            model = cv2.dnn.readNet(model_path)
-        except Exception as e:
-            return
+        # Determinar si usamos la NPU Hailo
+        use_hailo = HAILO_AVAILABLE and os.path.exists(hef_path)
+
+        if use_hailo:
+            print("[*] Interfaz Industrial: Inicializando NPU Hailo-8L...")
+            try:
+                hailo_model = HailoInference(hef_path)
+            except Exception as e:
+                print(f"[!] Error al iniciar Hailo NPU: {e}. Usando CPU fallback.")
+                use_hailo = False
+        
+        if not use_hailo:
+            print("[*] Interfaz Industrial: Cargando modelo en CPU...")
+            try:
+                model = cv2.dnn.readNet(model_path)
+            except Exception as e:
+                print(f"[!] Error al cargar modelo en CPU: {e}")
+                return
 
         # Adaptación para Cámara (0) o Archivo
         cv_source = 0 if self.source_file == "0" else self.source_file
         cap = cv2.VideoCapture(cv_source)
         
         if not cap.isOpened():
+            if use_hailo:
+                hailo_model.release()
             return
 
+        # --- OPTIMIZACIÓN A: Obtener FPS nativos para limitador de velocidad ---
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0 or fps > 120:
+            fps = 30.0
+        frame_delay = 1.0 / fps
+
         while self.running:
+            t_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 break
 
             image = frame.copy()
-            blob = cv2.dnn.blobFromImage(image, 1/255.0, (IMAGE_SIZE, IMAGE_SIZE), swapRB=True, crop=False)
-            model.setInput(blob)
-            preds = model.forward()
-            preds = preds.transpose((0, 2, 1))
-
             image_height, image_width, _ = image.shape
-            x_factor = image_width / IMAGE_SIZE
-            y_factor = image_height / IMAGE_SIZE
-
-            rows = preds[0].shape[0]
             class_ids, confs, boxes = list(), list(), list()
 
-            for i in range(rows):
-                row = preds[0][i]
-                conf = row[4]
-                classes_score = row[4:]
-                _, _, _, max_idx = cv2.minMaxLoc(classes_score)
-                class_id = max_idx[1]
-                if classes_score[class_id] > 0.25:
-                    confs.append(classes_score[class_id])
-                    class_ids.append(class_id)
-                    x, y, w, h = row[0].item(), row[1].item(), row[2].item(), row[3].item()
-                    left = int((x - 0.5 * w) * x_factor)
-                    top = int((y - 0.5 * h) * y_factor)
-                    width = int(w * x_factor)
-                    height = int(h * y_factor)
-                    boxes.append([left, top, width, height])
+            if use_hailo:
+                # --- PROCESAMIENTO EN NPU ---
+                # --- OPTIMIZACIÓN C: Redimensionamiento rápido con INTER_NEAREST para preprocesado ---
+                img_resized = cv2.resize(image, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
+                img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                
+                # Inferencia en el chip
+                out_tensor = hailo_model.infer(img_rgb)
+                
+                # Mapear detecciones del hardware NMS
+                detections = out_tensor[0]
+                for cid in range(len(detections)):
+                    class_detections = detections[cid]
+                    for det in class_detections:
+                        ymin, xmin, ymax, xmax, confidence = det
+                        if confidence >= 0.25:
+                            left = int(xmin * image_width)
+                            top = int(ymin * image_height)
+                            width = int((xmax - xmin) * image_width)
+                            height = int((ymax - ymin) * image_height)
+                            
+                            boxes.append([left, top, width, height])
+                            confs.append(float(confidence))
+                            class_ids.append(cid)
+                
+                indexes = list(range(len(boxes)))
+            else:
+                # --- PROCESAMIENTO EN CPU ---
+                blob = cv2.dnn.blobFromImage(image, 1/255.0, (IMAGE_SIZE, IMAGE_SIZE), swapRB=True, crop=False)
+                model.setInput(blob)
+                preds = model.forward()
+                preds = preds.transpose((0, 2, 1))
 
-            indexes = cv2.dnn.NMSBoxes(boxes, confs, 0.2, 0.5)
+                x_factor = image_width / IMAGE_SIZE
+                y_factor = image_height / IMAGE_SIZE
 
+                rows = preds[0].shape[0]
+                for i in range(rows):
+                    row = preds[0][i]
+                    classes_score = row[4:]
+                    _, _, _, max_idx = cv2.minMaxLoc(classes_score)
+                    class_id = max_idx[1]
+                    if classes_score[class_id] > 0.25:
+                        confs.append(classes_score[class_id])
+                        class_ids.append(class_id)
+                        x, y, w, h = row[0].item(), row[1].item(), row[2].item(), row[3].item()
+                        left = int((x - 0.5 * w) * x_factor)
+                        top = int((y - 0.5 * h) * y_factor)
+                        width = int(w * x_factor)
+                        height = int(h * y_factor)
+                        boxes.append([left, top, width, height])
+
+                indexes = cv2.dnn.NMSBoxes(boxes, confs, 0.2, 0.5)
+
+            # Dibujar detecciones
             if len(indexes) > 0:
-                for i in indexes.flatten():
+                indices_to_draw = indexes.flatten() if hasattr(indexes, 'flatten') else indexes
+                for i in indices_to_draw:
                     box = boxes[i]
                     class_id = class_ids[i]
                     score = confs[i]
@@ -230,14 +293,32 @@ class YOLODetectionThread(QThread):
                     name = f"{NAMES[class_id]} {round(float(score), 3)}"
                     cv2.putText(image, name, (left, top - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS[class_id], 2)
 
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            # --- OPTIMIZACIÓN B: Redimensionar en OpenCV antes de enviar a PySide (usando INTER_LINEAR rápido) ---
+            out_w, out_h = self.display_width, self.display_height
+            h_f, w_f = image.shape[:2]
+            scale = min(out_w / w_f, out_h / h_f)
+            new_w = int(w_f * scale)
+            new_h = int(h_f * scale)
+            
+            image_resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            rgb_image = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
+            h_r, w_r, ch = rgb_image.shape
+            bytes_per_line = ch * w_r
+            qt_image = QImage(rgb_image.data, w_r, h_r, bytes_per_line, QImage.Format_RGB888)
             
             self.change_pixmap_signal.emit(qt_image)
 
+            # --- OPTIMIZACIÓN A: Limitador de FPS dinámico ---
+            elapsed = time.time() - t_start
+            sleep_time = frame_delay - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
         cap.release()
+        if use_hailo:
+            print("[*] Interfaz Industrial: Liberando recursos de la NPU...")
+            hailo_model.release()
 
     def stop(self):
         self.running = False
@@ -334,10 +415,10 @@ class FactoryControlApp(QMainWindow):
         self.videos_layout = QVBoxLayout(scroll_content)
         self.videos_layout.setAlignment(Qt.AlignTop)
         
-        # Escaneo de Carpeta usando os
+        # Escaneo de Carpeta usando os y ordenando alfabéticamente
         videos_path = "yolov11-python/data/videos"
         if os.path.exists(videos_path):
-            videos = [f for f in os.listdir(videos_path) if f.endswith('.mp4')]
+            videos = sorted([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
             for video in videos:
                 btn = QPushButton(video)
                 btn.setProperty("class", "VideoBtn")
@@ -449,18 +530,20 @@ class FactoryControlApp(QMainWindow):
         else:
             source_path = "0"
             
-        self.yolo_thread = YOLODetectionThread(source_path)
+        # Obtener las dimensiones actuales de la etiqueta de video (con salvaguardas)
+        w = self.video_label.width()
+        h = self.video_label.height()
+        if w < 100 or h < 100:
+            w, h = 640, 480
+            
+        self.yolo_thread = YOLODetectionThread(source_path, w, h)
         self.yolo_thread.change_pixmap_signal.connect(self.update_image)
         self.yolo_thread.start()
 
     @Slot(QImage)
     def update_image(self, qt_image):
-        pixmap = QPixmap.fromImage(qt_image).scaled(
-            self.video_label.width(), 
-            self.video_label.height(), 
-            Qt.KeepAspectRatio, 
-            Qt.SmoothTransformation
-        )
+        # La imagen ya viene re-escalada con la relación de aspecto correcta desde el hilo secundario
+        pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
 
     def closeEvent(self, event):
