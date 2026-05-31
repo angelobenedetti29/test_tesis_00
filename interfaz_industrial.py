@@ -5,7 +5,7 @@ import numpy as np
 import random
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                                QVBoxLayout, QPushButton, QLabel, QFrame, QProgressBar, 
-                               QSpacerItem, QSizePolicy, QScrollArea)
+                               QSpacerItem, QSizePolicy, QScrollArea, QComboBox)
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
@@ -50,6 +50,33 @@ QMainWindow {
     background-color: #2D1B4E;
     border: 2px solid #00FFCC; /* Borde más intenso para indicar activo */
     color: #FFFFFF;
+}
+
+/* Estilización Premium para el Selector de Modelos (QComboBox) */
+QComboBox {
+    background-color: #2D1B4E;
+    border: 2px solid #5A4080;
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: #00FFCC;
+    font-family: 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    font-weight: bold;
+    margin: 5px 10px;
+}
+
+QComboBox:hover {
+    border: 2px solid #B026FF;
+    color: #FFFFFF;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #1A0B2E;
+    color: #E0B0FF;
+    selection-background-color: #B026FF;
+    selection-color: white;
+    border: 1px solid #5A4080;
+    border-radius: 5px;
 }
 
 #BtnLogout {
@@ -152,28 +179,29 @@ QProgressBar::chunk {
 class YOLODetectionThread(QThread):
     change_pixmap_signal = Signal(QImage)
 
-    def __init__(self, source_file="yolov11-python/data/videos/road.mp4"):
+    def __init__(self, source_file="yolov11-python/data/videos/road.mp4", model_path="yolov11-python/yolo11n.onnx", names_path="yolov11-python/data/class.names"):
         super().__init__()
         self.source_file = source_file
+        self.model_path = model_path
+        self.names_path = names_path
         self.running = True
 
     def run(self):
-        model_path = "yolov11-python/yolo11n.onnx"
-        names_path = "yolov11-python/data/class.names"
-        
         IMAGE_SIZE = 640
         NAMES = []
         try:
-            with open(names_path, "r") as f:
+            with open(self.names_path, "r", encoding="utf-8") as f:
                 NAMES = [cname.strip() for cname in f.readlines()]
         except Exception as e:
+            print(f"Error al abrir archivo de etiquetas: {e}")
             return
 
         COLORS = [[random.randint(0, 255) for _ in range(3)] for _ in NAMES]
         
         try:
-            model = cv2.dnn.readNet(model_path)
+            model = cv2.dnn.readNet(self.model_path)
         except Exception as e:
+            print(f"Error al cargar el modelo ONNX en OpenCV DNN: {e}")
             return
 
         # Adaptación para Cámara (0) o Archivo
@@ -181,6 +209,7 @@ class YOLODetectionThread(QThread):
         cap = cv2.VideoCapture(cv_source)
         
         if not cap.isOpened():
+            print(f"No se pudo abrir la fuente de video: {cv_source}")
             return
 
         while self.running:
@@ -227,7 +256,14 @@ class YOLODetectionThread(QThread):
                     left, top, width, height = box[0], box[1], box[2], box[3]
                     
                     cv2.rectangle(image, (left, top), (left + width, top + height), COLORS[class_id], 2)
-                    name = f"{NAMES[class_id]} {round(float(score), 3)}"
+                    
+                    # Intentar leer el nombre de la clase de manera segura
+                    try:
+                        c_name = NAMES[class_id]
+                    except IndexError:
+                        c_name = f"Clase {class_id}"
+                        
+                    name = f"{c_name} {round(float(score), 3)}"
                     cv2.putText(image, name, (left, top - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS[class_id], 2)
 
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -251,6 +287,10 @@ class FactoryControlApp(QMainWindow):
         self.resize(1200, 800)
         self.setStyleSheet(QSS)
         
+        # 1. Rutas iniciales de modelos
+        self.current_model = "yolov11-python/yolo11n.onnx"
+        self.current_names = "yolov11-python/data/class.names"
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
@@ -258,7 +298,7 @@ class FactoryControlApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 20, 20)
         main_layout.setSpacing(20)
 
-        # 1. BARRA LATERAL IZQUIERDA (SIDEBAR)
+        # 2. BARRA LATERAL IZQUIERDA (SIDEBAR)
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(250)
@@ -281,6 +321,20 @@ class FactoryControlApp(QMainWindow):
             sidebar_layout.addWidget(btn)
             self.nav_buttons.append(btn)
 
+        sidebar_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Fixed))
+
+        # --- SECCIÓN PREMIUM: SELECCIONADOR DE MODELOS ---
+        model_label = QLabel("🧠 MODELO ACTIVO")
+        model_label.setAlignment(Qt.AlignLeft)
+        model_label.setStyleSheet("font-size: 12px; margin-left: 12px; color: #E0B0FF;")
+        sidebar_layout.addWidget(model_label)
+
+        self.model_selector = QComboBox()
+        self.model_selector.addItem("YOLOv11 Original (COCO)")
+        self.model_selector.addItem("YOLOv11 Tostadas (Custom)")
+        self.model_selector.currentIndexChanged.connect(self.change_model)
+        sidebar_layout.addWidget(self.model_selector)
+
         sidebar_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         user_label = QLabel("USUARIO: ADMIN")
@@ -294,7 +348,7 @@ class FactoryControlApp(QMainWindow):
 
         main_layout.addWidget(sidebar)
 
-        # 2. ÁREA CENTRAL Y PANEL DERECHO
+        # 3. ÁREA CENTRAL Y PANEL DERECHO
         content_layout = QHBoxLayout()
         content_layout.setContentsMargins(0, 20, 0, 0)
         content_layout.setSpacing(20)
@@ -364,7 +418,6 @@ class FactoryControlApp(QMainWindow):
         chart_layout = QVBoxLayout(card_chart)
         chart_title = QLabel("MINI CHART")
         chart_title.setStyleSheet("font-weight: bold; font-size: 12px;")
-        # Fix SyntaxWarning
         chart_placeholder = QLabel("--- \\/\\/\\/ ---")
         chart_placeholder.setAlignment(Qt.AlignCenter)
         chart_placeholder.setStyleSheet("color: #B026FF; font-size: 24px;")
@@ -425,6 +478,28 @@ class FactoryControlApp(QMainWindow):
         self.yolo_thread = None
         self.play_internal_target("road.mp4")
 
+    # Lógica de cambio de modelo dinámico
+    def change_model(self, index):
+        if index == 0:
+            # YOLOv11 Original (COCO)
+            self.current_model = "yolov11-python/yolo11n.onnx"
+            self.current_names = "yolov11-python/data/class.names"
+            print("[INFO] Frente cambiado al Modelo Original (YOLOv11 COCO)")
+        elif index == 1:
+            # YOLOv11 Tostadas (Custom)
+            self.current_model = "yolov11-python/tostadas.onnx"
+            self.current_names = "yolov11-python/data/tostadas.names"
+            print("[INFO] Frente cambiado al Modelo de Tostadas (Personalizado)")
+            
+        # Si hay una detección en curso, reiniciar dinámicamente el hilo con el nuevo modelo
+        if self.yolo_thread is not None and self.yolo_thread.isRunning():
+            source = self.yolo_thread.source_file
+            if source == "0":
+                self.play_internal_target("0")
+            else:
+                video_name = os.path.basename(source)
+                self.play_internal_target(video_name)
+
     # Lógica Botón Cámara (Manejo de estado)
     def toggle_camera(self, checked):
         if checked:
@@ -449,7 +524,14 @@ class FactoryControlApp(QMainWindow):
         else:
             source_path = "0"
             
-        self.yolo_thread = YOLODetectionThread(source_path)
+        # Verificar que el modelo y las etiquetas existan
+        if not os.path.exists(self.current_model) or not os.path.exists(self.current_names):
+            self.video_label.clear()
+            self.video_label.setText(f"Error: No se encontró el modelo o las etiquetas\nCargar: {os.path.basename(self.current_model)}")
+            self.video_label.setStyleSheet("background-color: #2A1B2E; border-radius: 10px; color: #FF4500; font-weight: bold; text-align: center;")
+            return
+            
+        self.yolo_thread = YOLODetectionThread(source_path, self.current_model, self.current_names)
         self.yolo_thread.change_pixmap_signal.connect(self.update_image)
         self.yolo_thread.start()
 
