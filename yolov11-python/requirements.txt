@@ -2,3 +2,9 @@ opencv-python
 opencv-contrib-python
 onnxruntime
 ultralytics
+fastapi
+uvicorn[standard]
+requests
+customtkinter
+pillow
+python-multipart
