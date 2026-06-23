@@ -50,8 +50,10 @@ def resolve_path(relative_path):
     mapping = {
         "yolov11-python/yolo11n.onnx": "ai_training/models/yolo11n.onnx",
         "yolov11-python/tostadas.onnx": "ai_training/models/tostadas.onnx",
+        "yolov11-python/tostadas_v2.onnx": "ai_training/models/tostadas_v2.onnx",
         "yolov11-python/data/class.names": "ai_training/models/class.names",
         "yolov11-python/data/tostadas.names": "ai_training/models/tostadas.names",
+        "yolov11-python/data/tostadas_v2.names": "ai_training/models/tostadas_v2.names",
         "yolov11-python/data/videos/road.mp4": "multimedia/videos/road.mp4",
         "yolov11-python/data/videos": "multimedia/videos"
     }
@@ -387,6 +389,7 @@ class FactoryControlApp(QMainWindow):
         self.model_selector = QComboBox()
         self.model_selector.addItem("YOLOv11 Original (COCO)")
         self.model_selector.addItem("YOLOv11 Tostadas (Custom)")
+        self.model_selector.addItem("YOLOv11 Tostadas V2 (Nuevo)")
         self.model_selector.currentIndexChanged.connect(self.change_model)
         sidebar_layout.addWidget(self.model_selector)
 
@@ -672,6 +675,10 @@ class FactoryControlApp(QMainWindow):
             self.current_model = "yolov11-python/tostadas.onnx"
             self.current_names = "yolov11-python/data/tostadas.names"
             print("[INFO] Frente cambiado al Modelo de Tostadas (Personalizado)")
+        elif index == 2:
+            self.current_model = "yolov11-python/tostadas_v2.onnx"
+            self.current_names = "yolov11-python/data/tostadas_v2.names"
+            print("[INFO] Frente cambiado al Modelo de Tostadas V2 (Nuevo)")
             
         # Re-instanciar detector y caso de uso
         model_path = resolve_path(self.current_model)
